@@ -11,9 +11,19 @@ import { AnalyticsView } from '@/components/seatflow/AnalyticsView';
 import { TimelineView } from '@/components/seatflow/TimelineView';
 import { SettingsView } from '@/components/seatflow/SettingsView';
 import { AddCustomerModal } from '@/components/seatflow/AddCustomerModal';
-import { generateSeedQueue, generateSeedTables, generateSeedEvents } from '@/lib/seatflow/data';
+import { generateSeedTables, generateSeedEvents } from '@/lib/seatflow/data';
 
 const STORAGE_KEY = 'seatflow-state-v1';
+
+async function apiGet(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  if (!r.ok) throw new Error('api error');
+  return r.json();
+}
+async function apiSend(method, path, body) {
+  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  return r.json();
+}
 
 export default function Page() {
   const [authed, setAuthed] = useState(false);
@@ -24,34 +34,65 @@ export default function Page() {
   const [addOpen, setAddOpen] = useState(false);
   const [ready, setReady] = useState(false);
 
-  // Load state
+  // Load state + backend sync
   useEffect(() => {
+    // Local UI bits (auth + tables + events fallback)
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         setAuthed(parsed.authed || false);
-        setQueue(parsed.queue?.length ? parsed.queue : generateSeedQueue());
         setTables(parsed.tables?.length ? parsed.tables : generateSeedTables());
         setEvents(parsed.events?.length ? parsed.events : generateSeedEvents());
       } else {
-        setQueue(generateSeedQueue());
         setTables(generateSeedTables());
         setEvents(generateSeedEvents());
       }
     } catch {
-      setQueue(generateSeedQueue());
       setTables(generateSeedTables());
       setEvents(generateSeedEvents());
     }
-    setReady(true);
+
+    // Backend queue: fetch, seed if empty
+    (async () => {
+      try {
+        let items = await apiGet('/api/queue');
+        if (!items || items.length === 0) {
+          await apiSend('POST', '/api/queue/seed');
+          items = await apiGet('/api/queue');
+        }
+        setQueue(items || []);
+      } catch { setQueue([]); }
+      setReady(true);
+    })();
   }, []);
 
-  // Persist
+  // Poll backend queue every 4s (picks up guest self check-ins)
   useEffect(() => {
     if (!ready) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, queue, tables, events }));
-  }, [authed, queue, tables, events, ready]);
+    const t = setInterval(async () => {
+      try {
+        const items = await apiGet('/api/queue');
+        setQueue((prev) => {
+          // Detect new guest arrivals
+          const known = new Set(prev.map((q) => q.id));
+          const newcomers = (items || []).filter((q) => !known.has(q.id) && q.source === 'guest');
+          newcomers.forEach((n) => {
+            toast.success(`\ud83d\udc4b ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} \u00b7 party of ${n.party}` });
+            setEvents((ev) => [{ id: crypto.randomUUID(), type: 'added', message: `${n.name} self checked-in (party of ${n.party})`, time: Date.now() }, ...ev].slice(0, 40));
+          });
+          return items || [];
+        });
+      } catch {}
+    }, 4000);
+    return () => clearInterval(t);
+  }, [ready]);
+
+  // Persist local UI bits only (queue lives in backend)
+  useEffect(() => {
+    if (!ready) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, tables, events }));
+  }, [authed, tables, events, ready]);
 
   // Keyboard shortcut: N -> add customer
   useEffect(() => {
@@ -73,14 +114,18 @@ export default function Page() {
     setEvents((ev) => [{ id: crypto.randomUUID(), type, message, time: Date.now() }, ...ev].slice(0, 40));
   }, []);
 
-  const handleAdd = (item) => {
+  const handleAdd = async (item) => {
+    // Optimistic + persist to backend
     setQueue((q) => [...q, item].sort((a, b) => a.arrivalTime - b.arrivalTime));
     addEvent('added', `${item.name} added to queue (party of ${item.party})`);
-    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} · party of ${item.party}` });
+    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} \u00b7 party of ${item.party}` });
+    try {
+      await apiSend('POST', '/api/queue', { ...item, source: 'staff' });
+      const items = await apiGet('/api/queue'); setQueue(items || []);
+    } catch {}
   };
 
-  const handleSeat = (customer) => {
-    // Find best available table
+  const handleSeat = async (customer) => {
     const candidates = tables.filter((t) => t.status === 'available' && t.capacity >= customer.party).sort((a, b) => a.capacity - b.capacity);
     if (candidates.length === 0) {
       toast.error('No compatible table available', { description: `Need a table for ${customer.party}. Free one up first.` });
@@ -90,14 +135,16 @@ export default function Page() {
     setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
-    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} · party of ${customer.party}` });
+    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} \u00b7 party of ${customer.party}` });
+    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 
-  const handleAssign = (table, customer) => {
+  const handleAssign = async (table, customer) => {
     setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
     toast.success(`Seated at Table ${table.number}`);
+    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 
   const handleFreeTable = (table) => {
@@ -111,16 +158,18 @@ export default function Page() {
     toast(`Table ${table.number} · ${status}`);
   };
 
-  const handleRemove = (customer) => {
+  const handleRemove = async (customer) => {
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('left', `${customer.name} left the queue`);
     toast(`${customer.name} removed from queue`);
+    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'cancelled' }); } catch {}
   };
 
-  const handleNoShow = (customer) => {
+  const handleNoShow = async (customer) => {
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('left', `${customer.name} marked as no-show`);
     toast.warning(`${customer.name} marked as no-show`);
+    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'no_show' }); } catch {}
   };
 
   const handleLogout = () => { setAuthed(false); setView('dashboard'); };

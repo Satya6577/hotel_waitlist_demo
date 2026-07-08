@@ -5,6 +5,7 @@ import { QueueList } from './QueueCard';
 import { Card } from '@/components/ui/card';
 import { Plus, Users, Clock, Timer } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { CheckinQR } from './CheckinQR';
 
 export function QueueView({ queue, onAdd, onSeat, onRemove, onNoShow }) {
   const [filter, setFilter] = useState('all');
@@ -46,7 +47,12 @@ export function QueueView({ queue, onAdd, onSeat, onRemove, onNoShow }) {
         </TabsList>
       </Tabs>
 
-      <QueueList queue={filtered} onSeat={onSeat} onRemove={onRemove} onNoShow={onNoShow} />
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-4 lg:gap-6 items-start">
+        <QueueList queue={filtered} onSeat={onSeat} onRemove={onRemove} onNoShow={onNoShow} />
+        <div className="lg:sticky lg:top-20">
+          <CheckinQR />
+        </div>
+      </div>
     </div>
   );
 }

@@ -11,34 +11,9 @@ import { AnalyticsView } from '@/components/seatflow/AnalyticsView';
 import { TimelineView } from '@/components/seatflow/TimelineView';
 import { SettingsView } from '@/components/seatflow/SettingsView';
 import { AddCustomerModal } from '@/components/seatflow/AddCustomerModal';
-import { generateSeedTables, generateSeedEvents } from '@/lib/seatflow/data';
+import { generateSeedTables, generateSeedEvents, generateSeedQueue } from '@/lib/seatflow/data';
 
 const STORAGE_KEY = 'seatflow-state-v1';
-
-// Mock API functions for GitHub Pages (no server-side support)
-async function apiGet(path) {
-  // When deployed on GitHub Pages, return mock data
-  if (typeof window === 'undefined') return [];
-  
-  try {
-    const r = await fetch(path, { cache: 'no-store' });
-    if (!r.ok) throw new Error('api error');
-    return r.json();
-  } catch {
-    // Fallback to mock data for GitHub Pages
-    return [];
-  }
-}
-
-async function apiSend(method, path, body) {
-  // Mock API calls for GitHub Pages (local storage only)
-  try {
-    const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    return r.json();
-  } catch {
-    return { ok: true };
-  }
-}
 
 export default function Page() {
   const [authed, setAuthed] = useState(false);
@@ -49,56 +24,36 @@ export default function Page() {
   const [addOpen, setAddOpen] = useState(false);
   const [ready, setReady] = useState(false);
 
-  // Load state from local storage
+  // Initialize from local storage or generate seed data
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         setAuthed(parsed.authed || false);
+        setQueue(parsed.queue?.length ? parsed.queue : generateSeedQueue());
         setTables(parsed.tables?.length ? parsed.tables : generateSeedTables());
         setEvents(parsed.events?.length ? parsed.events : generateSeedEvents());
-        setQueue(parsed.queue?.length ? parsed.queue : generateSeedTables());
       } else {
+        setQueue(generateSeedQueue());
         setTables(generateSeedTables());
         setEvents(generateSeedEvents());
-        setQueue([]);
       }
     } catch {
+      setQueue(generateSeedQueue());
       setTables(generateSeedTables());
       setEvents(generateSeedEvents());
-      setQueue([]);
     }
     setReady(true);
   }, []);
 
-  // Poll for queue updates (local storage fallback)
+  // Persist to local storage
   useEffect(() => {
     if (!ready) return;
-    const t = setInterval(async () => {
-      try {
-        const items = await apiGet('/api/queue');
-        setQueue((prev) => {
-          const known = new Set(prev.map((q) => q.id));
-          const newcomers = (items || []).filter((q) => !known.has(q.id) && q.source === 'guest');
-          newcomers.forEach((n) => {
-            toast.success(`👋 ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} · party of ${n.party}` });
-            setEvents((ev) => [{ id: crypto.randomUUID(), type: 'added', message: `${n.name} self checked-in (party of ${n.party})`, time: Date.now() }, ...ev].slice(0, 40));
-          });
-          return items && items.length ? items : prev;
-        });
-      } catch {}
-    }, 4000);
-    return () => clearInterval(t);
-  }, [ready]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, queue, tables, events }));
+  }, [authed, queue, tables, events, ready]);
 
-  // Persist state to local storage
-  useEffect(() => {
-    if (!ready) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, tables, events, queue }));
-  }, [authed, tables, events, queue, ready]);
-
-  // Keyboard shortcut
+  // Keyboard shortcut: N -> add customer
   useEffect(() => {
     if (!authed) return;
     const handler = (e) => {
@@ -118,16 +73,13 @@ export default function Page() {
     setEvents((ev) => [{ id: crypto.randomUUID(), type, message, time: Date.now() }, ...ev].slice(0, 40));
   }, []);
 
-  const handleAdd = async (item) => {
+  const handleAdd = (item) => {
     setQueue((q) => [...q, item].sort((a, b) => a.arrivalTime - b.arrivalTime));
     addEvent('added', `${item.name} added to queue (party of ${item.party})`);
     toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} · party of ${item.party}` });
-    try {
-      await apiSend('POST', '/api/queue', { ...item, source: 'staff' });
-    } catch {}
   };
 
-  const handleSeat = async (customer) => {
+  const handleSeat = (customer) => {
     const candidates = tables.filter((t) => t.status === 'available' && t.capacity >= customer.party).sort((a, b) => a.capacity - b.capacity);
     if (candidates.length === 0) {
       toast.error('No compatible table available', { description: `Need a table for ${customer.party}. Free one up first.` });
@@ -138,15 +90,13 @@ export default function Page() {
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
     toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} · party of ${customer.party}` });
-    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 
-  const handleAssign = async (table, customer) => {
+  const handleAssign = (table, customer) => {
     setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
     toast.success(`Seated at Table ${table.number}`);
-    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 
   const handleFreeTable = (table) => {
@@ -160,18 +110,16 @@ export default function Page() {
     toast(`Table ${table.number} · ${status}`);
   };
 
-  const handleRemove = async (customer) => {
+  const handleRemove = (customer) => {
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('left', `${customer.name} left the queue`);
     toast(`${customer.name} removed from queue`);
-    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'cancelled' }); } catch {}
   };
 
-  const handleNoShow = async (customer) => {
+  const handleNoShow = (customer) => {
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('left', `${customer.name} marked as no-show`);
     toast.warning(`${customer.name} marked as no-show`);
-    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'no_show' }); } catch {}
   };
 
   const handleLogout = () => { setAuthed(false); setView('dashboard'); };

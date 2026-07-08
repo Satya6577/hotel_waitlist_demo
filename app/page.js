@@ -15,14 +15,29 @@ import { generateSeedTables, generateSeedEvents } from '@/lib/seatflow/data';
 
 const STORAGE_KEY = 'seatflow-state-v1';
 
+// Mock API functions for GitHub Pages (no server-side support)
 async function apiGet(path) {
-  const r = await fetch(path, { cache: 'no-store' });
-  if (!r.ok) throw new Error('api error');
-  return r.json();
+  // When deployed on GitHub Pages, return mock data
+  if (typeof window === 'undefined') return [];
+  
+  try {
+    const r = await fetch(path, { cache: 'no-store' });
+    if (!r.ok) throw new Error('api error');
+    return r.json();
+  } catch {
+    // Fallback to mock data for GitHub Pages
+    return [];
+  }
 }
+
 async function apiSend(method, path, body) {
-  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-  return r.json();
+  // Mock API calls for GitHub Pages (local storage only)
+  try {
+    const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    return r.json();
+  } catch {
+    return { ok: true };
+  }
 }
 
 export default function Page() {
@@ -34,9 +49,8 @@ export default function Page() {
   const [addOpen, setAddOpen] = useState(false);
   const [ready, setReady] = useState(false);
 
-  // Load state + backend sync
+  // Load state from local storage
   useEffect(() => {
-    // Local UI bits (auth + tables + events fallback)
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
@@ -44,57 +58,47 @@ export default function Page() {
         setAuthed(parsed.authed || false);
         setTables(parsed.tables?.length ? parsed.tables : generateSeedTables());
         setEvents(parsed.events?.length ? parsed.events : generateSeedEvents());
+        setQueue(parsed.queue?.length ? parsed.queue : generateSeedTables());
       } else {
         setTables(generateSeedTables());
         setEvents(generateSeedEvents());
+        setQueue([]);
       }
     } catch {
       setTables(generateSeedTables());
       setEvents(generateSeedEvents());
+      setQueue([]);
     }
-
-    // Backend queue: fetch, seed if empty
-    (async () => {
-      try {
-        let items = await apiGet('/api/queue');
-        if (!items || items.length === 0) {
-          await apiSend('POST', '/api/queue/seed');
-          items = await apiGet('/api/queue');
-        }
-        setQueue(items || []);
-      } catch { setQueue([]); }
-      setReady(true);
-    })();
+    setReady(true);
   }, []);
 
-  // Poll backend queue every 4s (picks up guest self check-ins)
+  // Poll for queue updates (local storage fallback)
   useEffect(() => {
     if (!ready) return;
     const t = setInterval(async () => {
       try {
         const items = await apiGet('/api/queue');
         setQueue((prev) => {
-          // Detect new guest arrivals
           const known = new Set(prev.map((q) => q.id));
           const newcomers = (items || []).filter((q) => !known.has(q.id) && q.source === 'guest');
           newcomers.forEach((n) => {
-            toast.success(`\ud83d\udc4b ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} \u00b7 party of ${n.party}` });
+            toast.success(`👋 ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} · party of ${n.party}` });
             setEvents((ev) => [{ id: crypto.randomUUID(), type: 'added', message: `${n.name} self checked-in (party of ${n.party})`, time: Date.now() }, ...ev].slice(0, 40));
           });
-          return items || [];
+          return items && items.length ? items : prev;
         });
       } catch {}
     }, 4000);
     return () => clearInterval(t);
   }, [ready]);
 
-  // Persist local UI bits only (queue lives in backend)
+  // Persist state to local storage
   useEffect(() => {
     if (!ready) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, tables, events }));
-  }, [authed, tables, events, ready]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, tables, events, queue }));
+  }, [authed, tables, events, queue, ready]);
 
-  // Keyboard shortcut: N -> add customer
+  // Keyboard shortcut
   useEffect(() => {
     if (!authed) return;
     const handler = (e) => {
@@ -115,13 +119,11 @@ export default function Page() {
   }, []);
 
   const handleAdd = async (item) => {
-    // Optimistic + persist to backend
     setQueue((q) => [...q, item].sort((a, b) => a.arrivalTime - b.arrivalTime));
     addEvent('added', `${item.name} added to queue (party of ${item.party})`);
-    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} \u00b7 party of ${item.party}` });
+    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} · party of ${item.party}` });
     try {
       await apiSend('POST', '/api/queue', { ...item, source: 'staff' });
-      const items = await apiGet('/api/queue'); setQueue(items || []);
     } catch {}
   };
 
@@ -135,7 +137,7 @@ export default function Page() {
     setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
-    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} \u00b7 party of ${customer.party}` });
+    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} · party of ${customer.party}` });
     try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 

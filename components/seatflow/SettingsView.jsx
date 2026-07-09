@@ -1,4 +1,5 @@
 'use client';
+import { useEffect, useState } from 'react';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -6,8 +7,9 @@ import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Building2, Clock, Utensils, Bell, Palette, Languages, Users } from 'lucide-react';
+import { Building2, Clock, Utensils, Bell, Palette, Languages, Users, Layers } from 'lucide-react';
 import { useTheme } from 'next-themes';
+import { SectionsManager } from './SectionsManager';
 
 function Section({ icon, title, description, children }) {
   return (
@@ -38,6 +40,11 @@ function Row({ label, description, children }) {
 
 export function SettingsView() {
   const { theme, setTheme } = useTheme();
+  const [sections, setSections] = useState([]);
+  const loadSections = async () => {
+    try { const r = await fetch('/api/sections', { credentials: 'include' }); setSections(await r.json()); } catch {}
+  };
+  useEffect(() => { loadSections(); }, []);
   return (
     <div className="p-4 md:p-6 lg:p-8 max-w-[900px] mx-auto space-y-6">
       <div>
@@ -45,6 +52,10 @@ export function SettingsView() {
         <h1 className="font-serif text-3xl md:text-4xl tracking-tight mt-1">Preferences</h1>
         <p className="text-sm text-muted-foreground mt-1">Tune SeatFlow to how your restaurant actually works.</p>
       </div>
+
+      <Section icon={<Layers className="h-4 w-4" />} title="Restaurant sections" description="Rename, reorder, recolor and enable/disable sections. Fully database-driven.">
+        <SectionsManager sections={sections} onRefresh={loadSections} />
+      </Section>
 
       <Section icon={<Building2 className="h-4 w-4" />} title="Restaurant details" description="Displayed on receipts and staff app.">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

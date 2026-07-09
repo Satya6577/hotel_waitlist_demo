@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getDb, clean } from '@/lib/db';
+import { publish } from '@/lib/events';
 import {
   hashPassword, verifyPassword, signToken, cookieHeader, clearCookieHeader,
   getUserFromRequest, ROLES, ROLE_ACCESS, DEFAULT_ROUTE, ROLE_LABELS,
@@ -27,9 +28,9 @@ async function ensureDefaults(db) {
   const secCount = await db.collection('sections').countDocuments({});
   if (secCount === 0) {
     await db.collection('sections').insertMany([
-      { id: crypto.randomUUID(), name: 'Section A', order: 1, color: 'emerald', createdAt: Date.now() },
-      { id: crypto.randomUUID(), name: 'Section B', order: 2, color: 'sky', createdAt: Date.now() },
-      { id: crypto.randomUUID(), name: 'Section C', order: 3, color: 'amber', createdAt: Date.now() },
+      { id: crypto.randomUUID(), name: 'Section A', order: 1, color: 'emerald', enabled: true, createdAt: Date.now() },
+      { id: crypto.randomUUID(), name: 'Section B', order: 2, color: 'sky', enabled: true, createdAt: Date.now() },
+      { id: crypto.randomUUID(), name: 'Section C', order: 3, color: 'amber', enabled: true, createdAt: Date.now() },
     ]);
   }
   const waiterCount = await db.collection('waiters').countDocuments({});
@@ -40,6 +41,32 @@ async function ensureDefaults(db) {
       { id: crypto.randomUUID(), name: 'Sagar Joshi', employeeId: 'EMP-103', phone: '+91 9834567890', status: 'busy', createdAt: Date.now() },
       { id: crypto.randomUUID(), name: 'Priya Deshmukh', employeeId: 'EMP-104', phone: '+91 9845678901', status: 'off_duty', createdAt: Date.now() },
     ]);
+  }
+  // Seed 12 tables across 3 sections (idempotent)
+  const tblCount = await db.collection('tables').countDocuments({});
+  if (tblCount === 0) {
+    const sections = await db.collection('sections').find({}).sort({ order: 1 }).toArray();
+    const cfg = [
+      { number: 1, capacity: 2 }, { number: 2, capacity: 2 }, { number: 3, capacity: 4 }, { number: 4, capacity: 4 },
+      { number: 5, capacity: 4 }, { number: 6, capacity: 6 }, { number: 7, capacity: 6 }, { number: 8, capacity: 8 },
+      { number: 9, capacity: 2 }, { number: 10, capacity: 4 }, { number: 11, capacity: 4 }, { number: 12, capacity: 6 },
+    ];
+    const statuses = ['available', 'occupied', 'available', 'cleaning', 'available', 'occupied',
+      'reserved', 'available', 'occupied', 'available', 'available', 'occupied'];
+    const now = Date.now();
+    const tables = cfg.map((t, i) => ({
+      id: crypto.randomUUID(),
+      number: t.number, capacity: t.capacity, status: statuses[i],
+      sectionId: sections[Math.min(Math.floor(i / 4), sections.length - 1)]?.id || null,
+      assignedWaiterId: null,
+      customerName: statuses[i] === 'occupied' ? ['Isha Reddy', 'Divya Menon', 'Raj Sharma', 'Meera Shah'][i % 4] : null,
+      customerPhone: statuses[i] === 'occupied' ? '+91 9876543210' : null,
+      reservedFor: statuses[i] === 'reserved' ? { name: 'Rahul Sharma', phone: '+91 9876543210', time: '7:30 PM' } : null,
+      seatedAt: statuses[i] === 'occupied' ? now - (5 + i * 3) * 60000 : null,
+      createdAt: now,
+      updatedAt: now,
+    }));
+    await db.collection('tables').insertMany(tables);
   }
 }
 
@@ -67,6 +94,17 @@ export async function GET(request, { params }) {
     if (p[0] === 'events') {
       const events = await db.collection('events').find({}).sort({ time: -1 }).limit(30).toArray();
       return ok(events.map(clean));
+    }
+
+    // ---- Tables (NEW) ----
+    if (p[0] === 'tables' && !p[1]) {
+      const items = await db.collection('tables').find({}).sort({ number: 1 }).toArray();
+      return ok(items.map(clean));
+    }
+    if (p[0] === 'tables' && p[1]) {
+      const item = await db.collection('tables').findOne({ id: p[1] });
+      if (!item) return bad('not found', 404);
+      return ok(clean(item));
     }
 
     // ---- Sections (NEW) ----
@@ -154,6 +192,7 @@ export async function POST(request, { params }) {
         time: Date.now(),
       });
       const ahead = await db.collection('queue').countDocuments({ status: 'waiting', arrivalTime: { $lt: doc.arrivalTime } });
+      publish('queue.added', clean(doc));
       return ok({ ...clean(doc), position: ahead + 1 });
     }
 
@@ -190,9 +229,11 @@ export async function POST(request, { params }) {
         name: String(body.name || `Section ${count + 1}`).slice(0, 40),
         order: Number(body.order) || count + 1,
         color: body.color || 'emerald',
+        enabled: body.enabled !== false,
         createdAt: Date.now(),
       };
       await db.collection('sections').insertOne(doc);
+      publish('section.added', clean(doc));
       return ok(clean(doc));
     }
 
@@ -210,6 +251,39 @@ export async function POST(request, { params }) {
         createdAt: Date.now(),
       };
       await db.collection('waiters').insertOne(doc);
+      publish('waiter.added', clean(doc));
+      return ok(clean(doc));
+    }
+
+    // ---- Tables (NEW) ----
+    if (p[0] === 'tables' && p[1] === 'seed') {
+      await ensureDefaults(db); // idempotent
+      return ok({ ok: true });
+    }
+    if (p[0] === 'tables' && p[1] === 'reset') {
+      const g = requireRole(request, ['super_admin', 'owner']);
+      if (g.error) return g.error;
+      await db.collection('tables').deleteMany({});
+      await ensureDefaults(db);
+      publish('tables.reset', {});
+      return ok({ ok: true });
+    }
+    if (p[0] === 'tables' && !p[1]) {
+      const g = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (g.error) return g.error;
+      const doc = {
+        id: crypto.randomUUID(),
+        number: Number(body.number) || 0,
+        capacity: Math.max(1, Math.min(30, Number(body.capacity) || 4)),
+        status: 'available',
+        sectionId: body.sectionId || null,
+        assignedWaiterId: null,
+        customerName: null, customerPhone: null,
+        reservedFor: null, seatedAt: null,
+        createdAt: Date.now(), updatedAt: Date.now(),
+      };
+      await db.collection('tables').insertOne(doc);
+      publish('table.added', clean(doc));
       return ok(clean(doc));
     }
 
@@ -235,6 +309,7 @@ export async function POST(request, { params }) {
         phone: String(phone || '').slice(0, 20),
         username: String(username).toLowerCase().slice(0, 40),
         role: finalRole,
+        active: true,
         passwordHash: hashPassword(String(password)),
         createdAt: Date.now(),
       };
@@ -244,6 +319,7 @@ export async function POST(request, { params }) {
       const { passwordHash, ...safe } = doc;
       const res = ok({ user: clean(safe), access: ROLE_ACCESS[doc.role], defaultRoute: DEFAULT_ROUTE[doc.role], roleLabel: ROLE_LABELS[doc.role] });
       res.headers.set('Set-Cookie', cookieHeader(token));
+      publish('user.added', { id: doc.id, name: doc.name, role: doc.role });
       return res;
     }
 
@@ -254,6 +330,7 @@ export async function POST(request, { params }) {
       const identifier = String(username).toLowerCase();
       const user = await db.collection('users').findOne({ $or: [{ username: identifier }, { email: identifier }] });
       if (!user) return bad('invalid credentials', 401);
+      if (user.active === false) return bad('account deactivated', 403);
       if (!verifyPassword(String(password), user.passwordHash)) return bad('invalid credentials', 401);
 
       const token = signToken({ id: user.id, username: user.username, role: user.role, name: user.name });
@@ -325,31 +402,72 @@ export async function PATCH(request, { params }) {
           time: Date.now(),
         });
       }
+      publish('queue.updated', { id: p[1], ...updates });
       return ok({ ok: true });
+    }
+
+    // Tables (NEW)
+    if (p[0] === 'tables' && p[1]) {
+      const g = requireRole(request, ['super_admin', 'owner', 'manager', 'waiter', 'receptionist']);
+      if (g.error) return g.error;
+      const existing = await db.collection('tables').findOne({ id: p[1] });
+      if (!existing) return bad('not found', 404);
+      const allowed = ['status', 'sectionId', 'assignedWaiterId', 'customerName', 'customerPhone', 'reservedFor', 'seatedAt', 'capacity', 'number'];
+      const updates = { updatedAt: Date.now() };
+      allowed.forEach((k) => { if (body[k] !== undefined) updates[k] = body[k]; });
+      await db.collection('tables').updateOne({ id: p[1] }, { $set: updates });
+      const after = await db.collection('tables').findOne({ id: p[1] });
+
+      // Detect reserved → available transition for notify-ready fanout
+      if (existing.status === 'reserved' && updates.status === 'available' && existing.reservedFor) {
+        publish('table.reserved_available', { table: clean(after), reservedFor: existing.reservedFor });
+      }
+      publish('table.updated', clean(after));
+      return ok(clean(after));
     }
 
     // Sections
     if (p[0] === 'sections' && p[1]) {
-      const g = requireRole(request, ['super_admin', 'owner', 'manager']);
-      if (g.error) return g.error;
+      const gd = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (gd.error) return gd.error;
       const updates = {};
       if (body.name != null) updates.name = String(body.name).slice(0, 40);
       if (body.order != null) updates.order = Number(body.order);
       if (body.color != null) updates.color = body.color;
+      if (body.enabled != null) updates.enabled = !!body.enabled;
       await db.collection('sections').updateOne({ id: p[1] }, { $set: updates });
+      publish('section.updated', { id: p[1], ...updates });
       return ok({ ok: true });
     }
 
     // Waiters
     if (p[0] === 'waiters' && p[1]) {
-      const g = requireRole(request, ['super_admin', 'owner', 'manager']);
-      if (g.error) return g.error;
+      const gd = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (gd.error) return gd.error;
       const updates = {};
       if (body.name != null) updates.name = String(body.name).slice(0, 60);
       if (body.employeeId != null) updates.employeeId = String(body.employeeId).slice(0, 20);
       if (body.phone != null) updates.phone = String(body.phone).slice(0, 20);
       if (body.status != null && ['available', 'busy', 'off_duty'].includes(body.status)) updates.status = body.status;
       await db.collection('waiters').updateOne({ id: p[1] }, { $set: updates });
+      publish('waiter.updated', { id: p[1], ...updates });
+      return ok({ ok: true });
+    }
+
+    // Users (super_admin only)
+    if (p[0] === 'users' && p[1]) {
+      const gd = requireRole(request, ['super_admin']);
+      if (gd.error) return gd.error;
+      const updates = {};
+      if (body.name != null) updates.name = String(body.name).slice(0, 80);
+      if (body.email != null) updates.email = String(body.email).toLowerCase().slice(0, 120);
+      if (body.phone != null) updates.phone = String(body.phone).slice(0, 20);
+      if (body.role != null && ROLES.includes(body.role)) updates.role = body.role;
+      if (body.active != null) updates.active = !!body.active;
+      if (body.password && String(body.password).length >= 6) updates.passwordHash = hashPassword(String(body.password));
+      await db.collection('users').updateOne({ id: p[1] }, { $set: updates });
+      const { passwordHash, ...safe } = updates;
+      publish('user.updated', { id: p[1], ...safe });
       return ok({ ok: true });
     }
 
@@ -367,19 +485,38 @@ export async function DELETE(request, { params }) {
 
     if (p[0] === 'queue' && p[1]) {
       await db.collection('queue').deleteOne({ id: p[1] });
+      publish('queue.removed', { id: p[1] });
       return ok({ ok: true });
     }
 
     if (p[0] === 'sections' && p[1]) {
-      const g = requireRole(request, ['super_admin', 'owner', 'manager']);
-      if (g.error) return g.error;
+      const gd = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (gd.error) return gd.error;
       await db.collection('sections').deleteOne({ id: p[1] });
+      publish('section.removed', { id: p[1] });
       return ok({ ok: true });
     }
     if (p[0] === 'waiters' && p[1]) {
-      const g = requireRole(request, ['super_admin', 'owner', 'manager']);
-      if (g.error) return g.error;
+      const gd = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (gd.error) return gd.error;
       await db.collection('waiters').deleteOne({ id: p[1] });
+      publish('waiter.removed', { id: p[1] });
+      return ok({ ok: true });
+    }
+    if (p[0] === 'tables' && p[1]) {
+      const gd = requireRole(request, ['super_admin', 'owner', 'manager']);
+      if (gd.error) return gd.error;
+      await db.collection('tables').deleteOne({ id: p[1] });
+      publish('table.removed', { id: p[1] });
+      return ok({ ok: true });
+    }
+    if (p[0] === 'users' && p[1]) {
+      const gd = requireRole(request, ['super_admin']);
+      if (gd.error) return gd.error;
+      // Prevent super_admin from deleting themselves
+      if (gd.user?.id === p[1]) return bad('cannot delete self', 400);
+      await db.collection('users').deleteOne({ id: p[1] });
+      publish('user.removed', { id: p[1] });
       return ok({ ok: true });
     }
 

@@ -6,20 +6,27 @@ import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { LayoutDashboard, ListOrdered, LayoutGrid, LineChart, Settings, Bell, Search, Sun, Moon, ChevronsUpDown, Utensils, LogOut, User, Building2 } from 'lucide-react';
+import { LayoutDashboard, ListOrdered, LayoutGrid, LineChart, Settings, Bell, Search, Sun, Moon, ChevronsUpDown, Utensils, LogOut, User, Building2, UserRound } from 'lucide-react';
 import { motion } from 'framer-motion';
 
-const NAV = [
+const NAV_ALL = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'queue', label: 'Queue', icon: ListOrdered, badge: 'live' },
   { id: 'tables', label: 'Tables', icon: LayoutGrid },
+  { id: 'waiters', label: 'Waiters', icon: UserRound },
   { id: 'timeline', label: 'Timeline', icon: Bell },
   { id: 'analytics', label: 'Analytics', icon: LineChart },
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
-export function AppShell({ view, setView, children, waitingCount, onLogout }) {
+export function AppShell({ view, setView, children, waitingCount, onLogout, currentUser, access }) {
   const { theme, setTheme } = useTheme();
+
+  // Filter nav by role access; if access is not provided (backward compat), show all
+  const NAV = access?.length ? NAV_ALL.filter((n) => access.includes(n.id)) : NAV_ALL;
+  const roleLabel = currentUser?.roleLabel || 'Restaurant Owner';
+  const initials = (currentUser?.name || 'User').split(' ').map((x) => x[0]).slice(0, 2).join('');
+  const firstName = (currentUser?.name || 'Aarav Sharma').split(' ')[0];
 
   return (
     <div className="min-h-screen w-full bg-muted/30 flex">
@@ -112,18 +119,18 @@ export function AppShell({ view, setView, children, waitingCount, onLogout }) {
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button className="ml-1 flex items-center gap-2 rounded-full hover:bg-accent p-1 pr-3">
-                  <Avatar className="h-7 w-7"><AvatarFallback className="bg-emerald-600 text-white text-xs">AS</AvatarFallback></Avatar>
-                  <span className="hidden md:inline text-sm font-medium">Aarav S.</span>
+                  <Avatar className="h-7 w-7"><AvatarFallback className="bg-emerald-600 text-white text-xs">{initials}</AvatarFallback></Avatar>
+                  <span className="hidden md:inline text-sm font-medium">{firstName}</span>
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-52">
                 <DropdownMenuLabel>
-                  <div className="text-sm font-medium">Aarav Sharma</div>
-                  <div className="text-xs text-muted-foreground font-normal">Manager · Spice House</div>
+                  <div className="text-sm font-medium">{currentUser?.name || 'Aarav Sharma'}</div>
+                  <div className="text-xs text-muted-foreground font-normal">{roleLabel} · Spice House</div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem><User className="h-4 w-4 mr-2" /> Profile</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setView('settings')}><Settings className="h-4 w-4 mr-2" /> Settings</DropdownMenuItem>
+                {(!access || access.includes('settings')) && <DropdownMenuItem onClick={() => setView('settings')}><Settings className="h-4 w-4 mr-2" /> Settings</DropdownMenuItem>}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={onLogout} className="text-destructive focus:text-destructive"><LogOut className="h-4 w-4 mr-2" /> Sign out</DropdownMenuItem>
               </DropdownMenuContent>

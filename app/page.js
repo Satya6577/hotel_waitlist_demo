@@ -6,55 +6,97 @@ import { Login } from '@/components/seatflow/Login';
 import { AppShell } from '@/components/seatflow/AppShell';
 import { Dashboard } from '@/components/seatflow/Dashboard';
 import { QueueView } from '@/components/seatflow/QueueView';
-import { TablesView } from '@/components/seatflow/TablesView';
+import { TablesViewV2 } from '@/components/seatflow/TablesViewV2';
 import { AnalyticsView } from '@/components/seatflow/AnalyticsView';
 import { TimelineView } from '@/components/seatflow/TimelineView';
 import { SettingsView } from '@/components/seatflow/SettingsView';
+import { WaitersView } from '@/components/seatflow/WaitersView';
 import { AddCustomerModal } from '@/components/seatflow/AddCustomerModal';
+import { NotifyReadyPopup } from '@/components/seatflow/NotifyReadyPopup';
 import { generateSeedTables, generateSeedEvents } from '@/lib/seatflow/data';
 
-const STORAGE_KEY = 'seatflow-state-v1';
+const STORAGE_KEY = 'seatflow-state-v2';
 
 async function apiGet(path) {
-  const r = await fetch(path, { cache: 'no-store' });
+  const r = await fetch(path, { cache: 'no-store', credentials: 'include' });
   if (!r.ok) throw new Error('api error');
   return r.json();
 }
 async function apiSend(method, path, body) {
-  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const r = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    credentials: 'include',
+  });
   return r.json();
 }
 
 export default function Page() {
   const [authed, setAuthed] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [access, setAccess] = useState(null);
   const [view, setView] = useState('dashboard');
+
   const [queue, setQueue] = useState([]);
   const [tables, setTables] = useState([]);
   const [events, setEvents] = useState([]);
+  const [sections, setSections] = useState([]);
+  const [waiters, setWaiters] = useState([]);
+
   const [addOpen, setAddOpen] = useState(false);
+  const [notifyPopup, setNotifyPopup] = useState(null); // { customer, table }
   const [ready, setReady] = useState(false);
 
-  // Load state + backend sync
+  // ----- Auth check on mount -----
   useEffect(() => {
-    // Local UI bits (auth + tables + events fallback)
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setAuthed(parsed.authed || false);
-        setTables(parsed.tables?.length ? parsed.tables : generateSeedTables());
-        setEvents(parsed.events?.length ? parsed.events : generateSeedEvents());
-      } else {
+    (async () => {
+      try {
+        const { user, access: acc, defaultRoute, roleLabel } = await apiGet('/api/auth/me');
+        if (user) {
+          setCurrentUser({ ...user, roleLabel });
+          setAccess(acc);
+          setAuthed(true);
+          setView(defaultRoute || 'dashboard');
+        }
+      } catch {}
+
+      // Local state
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          setTables(parsed.tables?.length ? parsed.tables : generateSeedTables());
+          setEvents(parsed.events?.length ? parsed.events : generateSeedEvents());
+        } else {
+          setTables(generateSeedTables());
+          setEvents(generateSeedEvents());
+        }
+      } catch {
         setTables(generateSeedTables());
         setEvents(generateSeedEvents());
       }
-    } catch {
-      setTables(generateSeedTables());
-      setEvents(generateSeedEvents());
-    }
+      setReady(true);
+    })();
+  }, []);
 
-    // Backend queue: fetch, seed if empty
+  // ----- Load reference data (sections + waiters) after auth OR when demo/authed -----
+  useEffect(() => {
+    if (!ready) return;
     (async () => {
+      try {
+        const [s, w] = await Promise.all([apiGet('/api/sections'), apiGet('/api/waiters')]);
+        setSections(s || []);
+        setWaiters(w || []);
+        // Bind sectionId onto seeded tables if they only have sectionSlot
+        setTables((prev) => prev.map((t) => {
+          if (t.sectionId) return t;
+          const slot = t.sectionSlot != null ? t.sectionSlot : 0;
+          const sec = (s || [])[Math.min(slot, (s || []).length - 1)];
+          return { ...t, sectionId: sec?.id };
+        }));
+      } catch {}
+
+      // Queue: fetch, seed if empty
       try {
         let items = await apiGet('/api/queue');
         if (!items || items.length === 0) {
@@ -63,22 +105,26 @@ export default function Page() {
         }
         setQueue(items || []);
       } catch { setQueue([]); }
-      setReady(true);
     })();
-  }, []);
+  }, [ready]);
 
-  // Poll backend queue every 4s (picks up guest self check-ins)
+  // ----- Persist local UI state (tables + events; queue/sections/waiters live in backend) -----
   useEffect(() => {
     if (!ready) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ tables, events }));
+  }, [tables, events, ready]);
+
+  // ----- Poll queue for guest self check-ins -----
+  useEffect(() => {
+    if (!ready || !authed) return;
     const t = setInterval(async () => {
       try {
         const items = await apiGet('/api/queue');
         setQueue((prev) => {
-          // Detect new guest arrivals
           const known = new Set(prev.map((q) => q.id));
           const newcomers = (items || []).filter((q) => !known.has(q.id) && q.source === 'guest');
           newcomers.forEach((n) => {
-            toast.success(`\ud83d\udc4b ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} \u00b7 party of ${n.party}` });
+            toast.success(`👋 ${n.name} joined via QR`, { description: `Queue #${String(n.number).padStart(2, '0')} · party of ${n.party}` });
             setEvents((ev) => [{ id: crypto.randomUUID(), type: 'added', message: `${n.name} self checked-in (party of ${n.party})`, time: Date.now() }, ...ev].slice(0, 40));
           });
           return items || [];
@@ -86,15 +132,9 @@ export default function Page() {
       } catch {}
     }, 4000);
     return () => clearInterval(t);
-  }, [ready]);
+  }, [ready, authed]);
 
-  // Persist local UI bits only (queue lives in backend)
-  useEffect(() => {
-    if (!ready) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ authed, tables, events }));
-  }, [authed, tables, events, ready]);
-
-  // Keyboard shortcut: N -> add customer
+  // ----- Keyboard shortcut: N for add customer -----
   useEffect(() => {
     if (!authed) return;
     const handler = (e) => {
@@ -114,48 +154,73 @@ export default function Page() {
     setEvents((ev) => [{ id: crypto.randomUUID(), type, message, time: Date.now() }, ...ev].slice(0, 40));
   }, []);
 
+  const refreshWaiters = async () => { try { setWaiters(await apiGet('/api/waiters') || []); } catch {} };
+
+  // ----- Queue handlers -----
   const handleAdd = async (item) => {
-    // Optimistic + persist to backend
     setQueue((q) => [...q, item].sort((a, b) => a.arrivalTime - b.arrivalTime));
     addEvent('added', `${item.name} added to queue (party of ${item.party})`);
-    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} \u00b7 party of ${item.party}` });
+    toast.success(`${item.name} added to queue`, { description: `Queue #${String(item.number).padStart(2, '0')} · party of ${item.party}` });
     try {
       await apiSend('POST', '/api/queue', { ...item, source: 'staff' });
       const items = await apiGet('/api/queue'); setQueue(items || []);
     } catch {}
   };
 
-  const handleSeat = async (customer) => {
-    const candidates = tables.filter((t) => t.status === 'available' && t.capacity >= customer.party).sort((a, b) => a.capacity - b.capacity);
-    if (candidates.length === 0) {
-      toast.error('No compatible table available', { description: `Need a table for ${customer.party}. Free one up first.` });
-      return;
-    }
-    const table = candidates[0];
-    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
+  const seatCustomerAtTable = async (customer, table, waiterId) => {
+    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, customerPhone: customer.phone, seatedAt: Date.now(), assignedWaiterId: waiterId || t.assignedWaiterId || null } : t));
     setQueue((q) => q.filter((c) => c.id !== customer.id));
     addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
-    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} \u00b7 party of ${customer.party}` });
+    toast.success(`Seated at Table ${table.number}`, { description: `${customer.name} · party of ${customer.party}` });
     try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
   };
 
-  const handleAssign = async (table, customer) => {
-    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'occupied', customerName: customer.name, seatedAt: Date.now() } : t));
-    setQueue((q) => q.filter((c) => c.id !== customer.id));
-    addEvent('seated', `Table ${table.number} assigned to ${customer.name}`);
-    toast.success(`Seated at Table ${table.number}`);
-    try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'seated', tableNumber: table.number }); } catch {}
+  const handleSeat = async (customer) => {
+    const candidates = tables.filter((t) => t.status === 'available' && t.capacity >= customer.party).sort((a, b) => a.capacity - b.capacity);
+    if (candidates.length === 0) { toast.error('No compatible table available', { description: `Need a table for ${customer.party}. Free one up first.` }); return; }
+    await seatCustomerAtTable(customer, candidates[0]);
+  };
+
+  const handleAssign = async (table, customer, waiterId) => {
+    await seatCustomerAtTable(customer, table, waiterId);
   };
 
   const handleFreeTable = (table) => {
-    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'cleaning', customerName: null, seatedAt: null } : t));
+    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status: 'cleaning', customerName: null, customerPhone: null, seatedAt: null } : t));
     addEvent('left', `Table ${table.number} finished · sent for cleaning`);
     toast(`Table ${table.number} freed`, { description: 'Marked for cleaning.' });
   };
 
   const handleSetTableStatus = (table, status) => {
-    setTables((ts) => ts.map((t) => t.id === table.id ? { ...t, status, customerName: status === 'available' ? null : t.customerName, seatedAt: status === 'available' ? null : t.seatedAt } : t));
+    // Detect reserved → available transition → trigger notification popup
+    const wasReserved = table.status === 'reserved' && !!table.reservedFor;
+    setTables((ts) => ts.map((t) => {
+      if (t.id !== table.id) return t;
+      const patch = { ...t, status };
+      if (status === 'available') { patch.customerName = null; patch.customerPhone = null; patch.seatedAt = null; }
+      return patch;
+    }));
     toast(`Table ${table.number} · ${status}`);
+    addEvent('table_status', `Table ${table.number} status → ${status}`);
+
+    if (wasReserved && status === 'available') {
+      // Fire notify popup
+      setNotifyPopup({ customer: table.reservedFor, table });
+    }
+  };
+
+  const handleUpdateTable = (tableId, patch) => {
+    setTables((ts) => ts.map((t) => t.id === tableId ? { ...t, ...patch } : t));
+    if (patch.status === 'reserved') toast.success('Reservation created', { description: patch.reservedFor?.name });
+    if (patch.assignedWaiterId !== undefined) {
+      const w = waiters.find((x) => x.id === patch.assignedWaiterId);
+      if (w) { toast(`Assigned ${w.name}`); addEvent('waiter_assigned', `${w.name} assigned to Table`); }
+    }
+  };
+
+  const handleNotifyReadyManual = (table) => {
+    if (table?.reservedFor) setNotifyPopup({ customer: table.reservedFor, table });
+    else toast.error('No reservation on this table');
   };
 
   const handleRemove = async (customer) => {
@@ -172,39 +237,69 @@ export default function Page() {
     try { await apiSend('PATCH', `/api/queue/${customer.id}`, { status: 'no_show' }); } catch {}
   };
 
-  const handleLogout = () => { setAuthed(false); setView('dashboard'); };
+  const handleLogout = async () => {
+    try { await apiSend('POST', '/api/auth/logout'); } catch {}
+    setAuthed(false); setCurrentUser(null); setAccess(null); setView('dashboard');
+  };
+
+  const onNotifySent = async () => {
+    if (!notifyPopup) return;
+    try {
+      await apiSend('POST', '/api/notifications', {
+        customerName: notifyPopup.customer?.name,
+        customerPhone: notifyPopup.customer?.phone,
+        tableNumber: notifyPopup.table?.number,
+        type: 'table_ready',
+        provider: 'whatsapp_click',
+        status: 'sent',
+      });
+    } catch {}
+    toast.success('📩 WhatsApp opened — click Send to notify guest');
+    addEvent('notified', `WhatsApp opened for ${notifyPopup.customer?.name} · Table ${notifyPopup.table?.number}`);
+    setNotifyPopup(null);
+  };
 
   if (!ready) return <div className="min-h-screen bg-background" />;
 
   if (!authed) {
-    return <Login onLogin={() => { setAuthed(true); toast.success('Welcome back to SeatFlow'); }} />;
+    return <Login onLogin={(data) => {
+      setCurrentUser({ ...data.user, roleLabel: data.roleLabel });
+      setAccess(data.access || null);
+      setAuthed(true);
+      setView(data.defaultRoute || 'dashboard');
+    }} />;
   }
 
+  const canAccess = (v) => !access || access.includes(v);
+
   const views = {
-    dashboard: <Dashboard queue={queue} tables={tables} events={events} onAdd={() => setAddOpen(true)} onSeat={handleSeat} onRemove={handleRemove} onNoShow={handleNoShow} setView={setView} />,
-    queue: <QueueView queue={queue} onAdd={() => setAddOpen(true)} onSeat={handleSeat} onRemove={handleRemove} onNoShow={handleNoShow} />,
-    tables: <TablesView tables={tables} queue={queue} onAssign={handleAssign} onFree={handleFreeTable} onSetStatus={handleSetTableStatus} />,
-    timeline: <TimelineView events={events} />,
-    analytics: <AnalyticsView />,
-    settings: <SettingsView />,
+    dashboard: canAccess('dashboard') && <Dashboard queue={queue} tables={tables} events={events} onAdd={() => setAddOpen(true)} onSeat={handleSeat} onRemove={handleRemove} onNoShow={handleNoShow} setView={setView} />,
+    queue: canAccess('queue') && <QueueView queue={queue} onAdd={() => setAddOpen(true)} onSeat={handleSeat} onRemove={handleRemove} onNoShow={handleNoShow} />,
+    tables: canAccess('tables') && <TablesViewV2 tables={tables} queue={queue} waiters={waiters} sections={sections} onAssign={handleAssign} onFree={handleFreeTable} onSetStatus={handleSetTableStatus} onUpdateTable={handleUpdateTable} onNotifyReady={handleNotifyReadyManual} />,
+    waiters: canAccess('waiters') && <WaitersView waiters={waiters} onRefresh={refreshWaiters} />,
+    timeline: canAccess('timeline') && <TimelineView events={events} />,
+    analytics: canAccess('analytics') && <AnalyticsView />,
+    settings: canAccess('settings') && <SettingsView />,
   };
+
+  const currentView = views[view] || (
+    <div className="p-8 max-w-lg mx-auto text-center">
+      <div className="font-serif text-2xl mb-2">Access restricted</div>
+      <div className="text-sm text-muted-foreground">Your role ({currentUser?.roleLabel}) doesn&apos;t have access to this section.</div>
+    </div>
+  );
 
   return (
     <>
-      <AppShell view={view} setView={setView} waitingCount={queue.length} onLogout={handleLogout}>
+      <AppShell view={view} setView={setView} waitingCount={queue.length} onLogout={handleLogout} currentUser={currentUser} access={access}>
         <AnimatePresence mode="wait">
-          <motion.div
-            key={view}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.22, ease: 'easeOut' }}
-          >
-            {views[view]}
+          <motion.div key={view} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.22, ease: 'easeOut' }}>
+            {currentView}
           </motion.div>
         </AnimatePresence>
       </AppShell>
       <AddCustomerModal open={addOpen} onOpenChange={setAddOpen} onAdd={handleAdd} nextNumber={nextNumber} />
+      <NotifyReadyPopup open={!!notifyPopup} item={notifyPopup} onClose={() => setNotifyPopup(null)} onSent={onNotifySent} />
     </>
   );
 }

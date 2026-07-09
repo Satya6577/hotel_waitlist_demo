@@ -186,9 +186,9 @@ export function Dashboard({ queue, tables, events, onAdd, onSeat, onRemove, onNo
 function MiniTable({ t }) {
   const map = {
     available: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 pulse-available',
-    occupied: 'border-slate-300 bg-muted text-muted-foreground',
-    cleaning: 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300',
-    reserved: 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+    occupied: 'border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300',
+    cleaning: 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+    reserved: 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300',
   };
   return (
     <div className={`aspect-square rounded-lg border flex flex-col items-center justify-center text-[11px] font-medium ${map[t.status]}`}>
